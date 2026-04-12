@@ -39,8 +39,14 @@ use reth_ethereum_forks::{
     ChainHardforks, DisplayHardforks, EthereumHardfork, EthereumHardforks, ForkCondition,
     ForkFilter, ForkFilterKey, ForkHash, ForkId, Hardfork, Hardforks, Head, DEV_HARDFORKS,
 };
-use reth_network_peers::{holesky_nodes, hoodi_nodes, mainnet_nodes, sepolia_nodes, NodeRecord};
+use reth_network_peers::{
+    holesky_nodes, hoodi_nodes, mainnet_nodes, polygon_nodes, sepolia_nodes, NodeRecord,
+};
 use reth_primitives_traits::{sync::LazyLock, BlockHeader, SealedHeader};
+
+const POLYGON_SHANGHAI_BLOCK: u64 = 50_523_000;
+const POLYGON_CANCUN_BLOCK: u64 = 54_876_000;
+const POLYGON_PRAGUE_BLOCK: u64 = 73_440_256;
 
 /// Helper method building a [`Header`] given [`Genesis`] and [`ChainHardforks`].
 pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
@@ -225,6 +231,27 @@ pub static HOODI: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     spec.into()
 });
 
+/// Polygon mainnet specification.
+pub static POLYGON: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
+    let genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/polygon.json"))
+        .expect("Can't deserialize Polygon genesis json");
+    let mut spec: ChainSpec = genesis.into();
+
+    // Live Bor peers advertise a fork ID that includes the post-London Ethereum
+    // hardforks activated on Polygon by block number.
+    spec.hardforks.insert(EthereumHardfork::Shanghai, ForkCondition::Block(POLYGON_SHANGHAI_BLOCK));
+    spec.hardforks.insert(EthereumHardfork::Cancun, ForkCondition::Block(POLYGON_CANCUN_BLOCK));
+    spec.hardforks.insert(EthereumHardfork::Prague, ForkCondition::Block(POLYGON_PRAGUE_BLOCK));
+
+    spec.chain = Chain::from_named(NamedChain::Polygon);
+    spec.genesis_header = SealedHeader::new(
+        make_genesis_header(&spec.genesis, &spec.hardforks),
+        b256!("0xa9c28ce2141b56c474f1dc504bee9b01eb1bd7d1a507580d5519d4437a97de1b"),
+    );
+
+    spec.into()
+});
+
 /// Dev testnet specification
 ///
 /// Includes 20 prefunded accounts with `10_000` ETH each derived from mnemonic "test test test test
@@ -341,8 +368,8 @@ pub fn blob_params_to_schedule(
     let bpo_forks = EthereumHardfork::bpo_variants();
     for (timestamp, blob_params) in &params.scheduled {
         for bpo_fork in bpo_forks {
-            if let ForkCondition::Timestamp(fork_ts) = hardforks.fork(bpo_fork) &&
-                fork_ts == *timestamp
+            if let ForkCondition::Timestamp(fork_ts) = hardforks.fork(bpo_fork)
+                && fork_ts == *timestamp
             {
                 schedule.insert(bpo_fork.name().to_lowercase(), *blob_params);
                 break;
@@ -464,6 +491,7 @@ impl ChainSpec {
     pub fn from_chain_id(chain_id: u64) -> Option<Arc<Self>> {
         match NamedChain::try_from(chain_id).ok()? {
             NamedChain::Mainnet => Some(MAINNET.clone()),
+            NamedChain::Polygon => Some(POLYGON.clone()),
             NamedChain::Sepolia => Some(SEPOLIA.clone()),
             NamedChain::Holesky => Some(HOLESKY.clone()),
             NamedChain::Hoodi => Some(HOODI.clone()),
@@ -534,7 +562,7 @@ impl<H: BlockHeader> ChainSpec<H> {
                 // given timestamp.
                 for (fork, params) in bf_params.iter().rev() {
                     if self.hardforks.is_fork_active_at_timestamp(fork.clone(), timestamp) {
-                        return *params
+                        return *params;
                     }
                 }
 
@@ -627,8 +655,8 @@ impl<H: BlockHeader> ChainSpec<H> {
             // We filter out TTD-based forks w/o a pre-known block since those do not show up in
             // the fork filter.
             Some(match condition {
-                ForkCondition::Block(block) |
-                ForkCondition::TTD { fork_block: Some(block), .. } => ForkFilterKey::Block(block),
+                ForkCondition::Block(block)
+                | ForkCondition::TTD { fork_block: Some(block), .. } => ForkFilterKey::Block(block),
                 ForkCondition::Timestamp(time) => ForkFilterKey::Time(time),
                 _ => return None,
             })
@@ -662,8 +690,8 @@ impl<H: BlockHeader> ChainSpec<H> {
         for (_, cond) in self.hardforks.forks_iter() {
             // handle block based forks and the sepolia merge netsplit block edge case (TTD
             // ForkCondition with Some(block))
-            if let ForkCondition::Block(block) |
-            ForkCondition::TTD { fork_block: Some(block), .. } = cond
+            if let ForkCondition::Block(block)
+            | ForkCondition::TTD { fork_block: Some(block), .. } = cond
             {
                 if head.number >= block {
                     // skip duplicated hardforks: hardforks enabled at genesis block
@@ -674,7 +702,7 @@ impl<H: BlockHeader> ChainSpec<H> {
                 } else {
                     // we can return here because this block fork is not active, so we set the
                     // `next` value
-                    return ForkId { hash: forkhash, next: block }
+                    return ForkId { hash: forkhash, next: block };
                 }
             }
         }
@@ -696,7 +724,7 @@ impl<H: BlockHeader> ChainSpec<H> {
                 // can safely return here because we have already handled all block forks and
                 // have handled all active timestamp forks, and set the next value to the
                 // timestamp that is known but not active yet
-                return ForkId { hash: forkhash, next: timestamp }
+                return ForkId { hash: forkhash, next: timestamp };
             }
         }
 
@@ -774,6 +802,7 @@ impl<H: BlockHeader> ChainSpec<H> {
 
         match self.chain.try_into().ok()? {
             C::Mainnet => Some(mainnet_nodes()),
+            C::Polygon => Some(polygon_nodes()),
             C::Sepolia => Some(sepolia_nodes()),
             C::Holesky => Some(holesky_nodes()),
             C::Hoodi => Some(hoodi_nodes()),

@@ -10,7 +10,7 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_util::hash_or_num_value_parser;
 use reth_config::Config;
-use reth_network::{BlockDownloaderProvider, NetworkConfigBuilder};
+use reth_network::BlockDownloaderProvider;
 use reth_network_p2p::bodies::client::BodiesClient;
 use reth_node_core::{
     args::{DatadirArgs, NetworkArgs},
@@ -192,25 +192,18 @@ impl<C: ChainSpecParser> DownloadArgs<C> {
 
         let default_secret_key_path = data_dir.p2p_secret();
         let p2p_secret_key = self.network.secret_key(default_secret_key_path)?;
-        let rlpx_socket = (self.network.addr, self.network.port).into();
-        let boot_nodes = self
+        let net = self
             .network
-            .resolved_bootnodes()
-            .unwrap_or_else(|| self.chain.bootnodes().unwrap_or_default());
-
-        let net =
-            NetworkConfigBuilder::<N::NetworkPrimitives>::new(p2p_secret_key, Runtime::test())
-                .peer_config(config.peers_config_with_basic_nodes_from_file(None))
-                .sessions_config(config.sessions)
-                .external_ip_resolver(self.network.nat.clone())
-                .network_id(self.network.network_id)
-                .boot_nodes(boot_nodes.clone())
-                .apply(|builder| {
-                    self.network.discovery.apply_to_builder(builder, rlpx_socket, boot_nodes)
-                })
-                .build_with_noop_provider(self.chain.clone())
-                .manager()
-                .await?;
+            .network_config::<N::NetworkPrimitives>(
+                &config,
+                self.chain.clone(),
+                p2p_secret_key,
+                data_dir.known_peers(),
+                Runtime::test(),
+            )
+            .build_with_noop_provider(self.chain.clone())
+            .manager()
+            .await?;
         let handle = net.handle().clone();
         tokio::task::spawn(net);
 

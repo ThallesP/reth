@@ -3761,12 +3761,13 @@ dependencies = [
 name = "example-polygon-p2p"
 version = "0.0.0"
 dependencies = [
- "alloy-genesis",
+ "alloy-eips",
+ "eyre",
  "reth-discv4",
  "reth-ethereum",
+ "reth-network-p2p",
  "reth-tracing",
  "secp256k1 0.30.0",
- "serde_json",
  "tokio",
  "tokio-stream",
 ]
@@ -9062,6 +9063,7 @@ dependencies = [
  "reth-discv5",
  "reth-engine-local",
  "reth-engine-primitives",
+ "reth-eth-wire",
  "reth-ethereum-forks",
  "reth-net-banlist",
  "reth-net-nat",

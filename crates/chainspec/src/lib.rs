@@ -33,7 +33,7 @@ pub use spec::test_fork_ids;
 pub use spec::{
     blob_params_to_schedule, create_chain_config, mainnet_chain_config, make_genesis_header,
     BaseFeeParams, BaseFeeParamsKind, ChainSpec, ChainSpecBuilder, ChainSpecProvider,
-    DepositContract, ForkBaseFeeParams, DEV, HOLESKY, HOODI, MAINNET, SEPOLIA,
+    DepositContract, ForkBaseFeeParams, DEV, HOLESKY, HOODI, MAINNET, POLYGON, SEPOLIA,
 };
 
 #[cfg(test)]
@@ -137,6 +137,13 @@ mod tests {
         let s = "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.holesky.ethdisco.net";
         let chain: Chain = NamedChain::Holesky.into();
         assert_eq!(s, chain.public_dns_network_protocol().unwrap().as_str());
+    }
+
+    #[test]
+    fn test_polygon_fork_id_matches_live_bor_peers() {
+        let expected = ForkId { hash: ForkHash([0x22, 0xd5, 0x23, 0xb2]), next: 0 };
+        let head = Head { number: 73_440_256, ..Default::default() };
+        assert_eq!(POLYGON.fork_id(&head), expected);
     }
 
     #[test]

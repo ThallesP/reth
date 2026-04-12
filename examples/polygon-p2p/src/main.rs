@@ -3,7 +3,7 @@
 //! Run with
 //!
 //! ```sh
-//! cargo run -p polygon-p2p
+//! cargo run -p example-polygon-p2p
 //! ```
 //!
 //! This launches a regular reth node overriding the engine api payload builder with our custom.
@@ -12,30 +12,37 @@
 
 #![warn(unused_crate_dependencies)]
 
+use alloy_eips::BlockHashOrNumber;
 use chain_cfg::{boot_nodes, head, polygon_chain_spec};
+use eyre::{eyre, Result};
 use reth_discv4::Discv4ConfigBuilder;
 use reth_ethereum::{
     network::{
-        api::events::SessionInfo, config::NetworkMode, NetworkConfig, NetworkEvent,
-        NetworkEventListenerProvider, NetworkManager,
+        api::events::{PeerEvent, SessionInfo},
+        config::NetworkMode,
+        eth_wire::{EthVersion, HelloMessage},
+        NetworkConfig, NetworkEvent, NetworkEventListenerProvider, NetworkManager, PeersInfo,
     },
     tasks::Runtime,
 };
+use reth_network_p2p::{download::DownloadClient, headers::client::HeadersRequest, HeadersClient};
 use reth_tracing::{
-    tracing::info, tracing_subscriber::filter::LevelFilter, LayerInfo, LogFormat, RethTracer,
-    Tracer,
+    tracing::{info, warn},
+    tracing_subscriber::filter::LevelFilter,
+    LayerInfo, LogFormat, RethTracer, Tracer,
 };
 use secp256k1::{rand, SecretKey};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     time::Duration,
 };
+use tokio::time::timeout;
 use tokio_stream::StreamExt;
 
 pub mod chain_cfg;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     // The ECDSA private key used to create our enode identifier.
     let secret_key = SecretKey::new(&mut rand::thread_rng());
 
@@ -48,41 +55,111 @@ async fn main() {
         ))
         .init();
 
-    // The local address we want to bind to
-    let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 30303);
+    // Use a non-default port so the example can run next to a local node.
+    let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 30304);
+    let chain_spec = polygon_chain_spec();
+    let genesis_hash = chain_spec.genesis_hash();
 
-    // The network configuration
-    let net_cfg = NetworkConfig::builder(secret_key, Runtime::test())
+    // Bor peers consistently support eth/68. Sticking to it avoids the extra
+    // eth/69 status fields while still supporting header requests.
+    let builder = NetworkConfig::builder(secret_key, Runtime::test());
+    let hello = HelloMessage::builder(builder.get_peer_id())
+        .protocols([EthVersion::Eth68.into(), EthVersion::Eth67.into(), EthVersion::Eth66.into()])
+        .build();
+
+    let net_cfg = builder
         .set_head(head())
         .network_mode(NetworkMode::Work)
         .listener_addr(local_addr)
-        .build_with_noop_provider(polygon_chain_spec());
+        .hello_message(hello)
+        .build_with_noop_provider(chain_spec.clone());
 
-    // Set Discv4 lookup interval to 1 second
     let mut discv4_cfg = Discv4ConfigBuilder::default();
-    let interval = Duration::from_secs(1);
-    discv4_cfg.add_boot_nodes(boot_nodes()).lookup_interval(interval);
+    discv4_cfg.add_boot_nodes(boot_nodes()).lookup_interval(Duration::from_secs(1));
     let net_cfg = net_cfg.set_discovery_v4(discv4_cfg.build());
 
-    let net_manager = NetworkManager::eth(net_cfg).await.unwrap();
+    info!(
+        genesis_hash = ?genesis_hash,
+        fork_id = ?chain_spec.fork_id(&head()),
+        "Polygon chain spec info"
+    );
 
-    // The network handle is our entrypoint into the network.
-    let net_handle = net_manager.handle();
+    let net_manager = NetworkManager::eth(net_cfg).await?;
+    let fetch_client = net_manager.fetch_client();
+    let net_handle = net_manager.handle().clone();
     let mut events = net_handle.event_listener();
 
-    // NetworkManager is a long-running task, let's spawn it
     tokio::spawn(net_manager);
     info!("Looking for Polygon peers...");
 
-    while let Some(evt) = events.next().await {
-        // For the sake of the example we only print the session established event
-        // with the chain-specific details
-        if let NetworkEvent::ActivePeerSession { info, .. } = evt {
-            let SessionInfo { status, client_version, .. } = info;
-            let chain = status.chain;
-            info!(?chain, ?client_version, "Session established with a new peer.");
+    timeout(Duration::from_secs(120), async {
+        while let Some(evt) = events.next().await {
+            match evt {
+                NetworkEvent::ActivePeerSession { info, .. } => {
+                    let SessionInfo { status, client_version, version, peer_id, .. } = info;
+                    info!(
+                        peers = net_handle.num_connected_peers(),
+                        %peer_id,
+                        ?version,
+                        chain = %status.chain,
+                        fork_id = ?status.forkid,
+                        ?client_version,
+                        "Session established with a Polygon peer"
+                    );
+                    return Ok(());
+                }
+                NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
+                    info!(
+                        peers = net_handle.num_connected_peers(),
+                        %peer_id,
+                        ?reason,
+                        "Session closed"
+                    );
+                }
+                NetworkEvent::Peer(_) => {}
+            }
         }
-        // More events here
+        Err(eyre!("event stream ended before a Polygon session was established"))
+    })
+    .await
+    .map_err(|_| eyre!("timed out waiting for a Polygon devp2p peer"))??;
+
+    for attempt in 1..=5 {
+        match timeout(
+            Duration::from_secs(20),
+            fetch_client.get_headers(HeadersRequest::one(BlockHashOrNumber::Hash(genesis_hash))),
+        )
+        .await
+        {
+            Ok(Ok(headers)) => {
+                let (peer_id, headers) = headers.split();
+                if let Some(header) = headers.into_iter().next() {
+                    let header_hash = header.hash_slow();
+                    if header_hash != genesis_hash {
+                        fetch_client.report_bad_message(peer_id);
+                        warn!(
+                            attempt,
+                            %peer_id,
+                            expected = ?genesis_hash,
+                            got = ?header_hash,
+                            number = header.number,
+                            "Peer returned the wrong Polygon genesis header"
+                        );
+                        continue;
+                    }
+
+                    info!(%peer_id, "Received Polygon header response");
+                    println!("requested Polygon genesis header");
+                    println!("{header:#?}");
+                    return Ok(());
+                }
+
+                warn!(attempt, %peer_id, "Peer returned an empty header response");
+            }
+            Ok(Err(err)) => warn!(attempt, ?err, "Header request failed"),
+            Err(_) => warn!(attempt, "Timed out requesting the Polygon genesis header"),
+        }
     }
-    // We will be disconnected from peers since we are not able to respond to network requests
+
+    Err(eyre!("failed to fetch the Polygon genesis header after multiple attempts"))
 }

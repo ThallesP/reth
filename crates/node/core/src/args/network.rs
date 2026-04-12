@@ -20,6 +20,7 @@ use reth_discv5::{
     discv5::ListenConfig, DEFAULT_COUNT_BOOTSTRAP_LOOKUPS, DEFAULT_DISCOVERY_V5_PORT,
     DEFAULT_SECONDS_BOOTSTRAP_LOOKUP_INTERVAL, DEFAULT_SECONDS_LOOKUP_INTERVAL,
 };
+use reth_eth_wire::EthVersion;
 use reth_net_banlist::IpFilter;
 use reth_net_nat::{NatResolver, DEFAULT_NET_IF_NAME};
 use reth_network::{
@@ -499,6 +500,7 @@ impl NetworkArgs {
         executor: Runtime,
     ) -> NetworkConfigBuilder<N> {
         let addr = self.resolved_addr();
+        let chain = chain_spec.chain();
         let chain_bootnodes = self
             .resolved_bootnodes()
             .unwrap_or_else(|| chain_spec.bootnodes().unwrap_or_else(mainnet_nodes));
@@ -516,7 +518,7 @@ impl NetworkArgs {
             .with_enforce_enr_fork_id(self.enforce_enr_fork_id);
 
         // Configure basic network stack
-        NetworkConfigBuilder::<N>::new(secret_key, executor)
+        let mut builder = NetworkConfigBuilder::<N>::new(secret_key, executor)
             .external_ip_resolver(self.nat.clone())
             .sessions_config(
                 config.sessions.clone().with_upscaled_event_buffer(peers_config.max_peers()),
@@ -527,11 +529,16 @@ impl NetworkArgs {
             // Configure node identity
             .apply(|builder| {
                 let peer_id = builder.get_peer_id();
-                builder.hello_message(
-                    HelloMessageWithProtocols::builder(peer_id)
-                        .client_version(&self.identity)
-                        .build(),
-                )
+                let mut hello =
+                    HelloMessageWithProtocols::builder(peer_id).client_version(&self.identity);
+                if chain.is_polygon() {
+                    hello = hello.protocols([
+                        EthVersion::Eth68.into(),
+                        EthVersion::Eth67.into(),
+                        EthVersion::Eth66.into(),
+                    ]);
+                }
+                builder.hello_message(hello.build())
             })
             // apply discovery settings
             .apply(|builder| {
@@ -550,7 +557,13 @@ impl NetworkArgs {
             .disable_tx_gossip(self.disable_tx_gossip)
             .required_block_hashes(self.required_block_hashes.clone())
             .eth_max_message_size_opt(self.eth_max_message_size.map(NonZeroUsize::get))
-            .network_id(self.network_id)
+            .network_id(self.network_id);
+
+        if chain.is_polygon() {
+            builder = builder.with_pow();
+        }
+
+        builder
     }
 
     /// If `no_persist_peers` is false then this returns the path to the persistent peers file path.
@@ -848,9 +861,9 @@ impl DiscoveryArgs {
             return false;
         }
 
-        self.enable_discv5_discovery ||
-            self.discv5_addr.is_some() ||
-            self.discv5_addr_ipv6.is_some()
+        self.enable_discv5_discovery
+            || self.discv5_addr.is_some()
+            || self.discv5_addr_ipv6.is_some()
     }
 
     /// Set the discovery port to zero, to allow the OS to assign a random unused port when
@@ -917,8 +930,10 @@ fn parse_block_num_hash(s: &str) -> Result<BlockNumHash, String> {
 mod tests {
     use super::*;
     use clap::Parser;
-    use reth_chainspec::MAINNET;
+    use reth_chainspec::{MAINNET, POLYGON};
     use reth_config::Config;
+    use reth_eth_wire::EthVersion;
+    use reth_network::config::NetworkMode;
     use reth_network_peers::NodeRecord;
     use secp256k1::SecretKey;
     use std::{
@@ -1333,5 +1348,36 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_file(&peers_file);
+    }
+
+    #[test]
+    fn polygon_network_config_uses_pow_and_eth68_hello() {
+        let args = NetworkArgs::default();
+        let secret_key = SecretKey::from_byte_array(&[7u8; 32]).unwrap();
+        let builder = args.network_config::<reth_network::EthNetworkPrimitives>(
+            &Config::default(),
+            POLYGON.clone(),
+            secret_key,
+            std::env::temp_dir().join("polygon-peers.json"),
+            Runtime::test(),
+        );
+
+        let net_cfg = builder.build_with_noop_provider(POLYGON.clone());
+
+        assert_eq!(net_cfg.network_mode, NetworkMode::Work);
+        assert_eq!(
+            net_cfg
+                .hello_message
+                .protocols
+                .iter()
+                .filter(|protocol| protocol.cap.name == "eth")
+                .map(|protocol| protocol.cap.version)
+                .collect::<Vec<_>>(),
+            vec![
+                EthVersion::Eth68 as usize,
+                EthVersion::Eth67 as usize,
+                EthVersion::Eth66 as usize,
+            ]
+        );
     }
 }

@@ -32,6 +32,9 @@ use crate::{
 };
 pub use secp256k1::SecretKey;
 
+const POLYGON_DNS_DISCOVERY: &str =
+    "enrtree://AKUEZKN7PSKVNR65FZDHECMKOJQSGPARGTPPBI7WS2VUL4EGR6XPC@pos.polygon-peers.io";
+
 /// Convenience function to create a new random [`SecretKey`]
 pub fn rng_secret_key() -> SecretKey {
     SecretKey::new(&mut rand_08::thread_rng())
@@ -684,11 +687,15 @@ impl<N: NetworkPrimitives> NetworkConfigBuilder<N> {
 
         // If default DNS config is used then we add the known dns network to bootstrap from
         if let Some(dns_networks) =
-            dns_discovery_config.as_mut().and_then(|c| c.bootstrap_dns_networks.as_mut()) &&
-            dns_networks.is_empty() &&
-            let Some(link) = chain_spec.chain().public_dns_network_protocol()
+            dns_discovery_config.as_mut().and_then(|c| c.bootstrap_dns_networks.as_mut())
+            && dns_networks.is_empty()
         {
-            dns_networks.insert(link.parse().expect("is valid DNS link entry"));
+            if let Some(link) = chain_spec.chain().public_dns_network_protocol() {
+                dns_networks.insert(link.parse().expect("is valid DNS link entry"));
+            } else if chain_spec.chain().is_polygon() {
+                dns_networks
+                    .insert(POLYGON_DNS_DISCOVERY.parse().expect("is valid DNS link entry"));
+            }
         }
 
         NetworkConfig {
@@ -751,7 +758,7 @@ mod tests {
     use alloy_genesis::Genesis;
     use alloy_primitives::U256;
     use reth_chainspec::{
-        Chain, ChainSpecBuilder, EthereumHardfork, ForkCondition, ForkId, MAINNET,
+        Chain, ChainSpecBuilder, EthereumHardfork, ForkCondition, ForkId, MAINNET, POLYGON,
     };
     use reth_discv5::build_local_enr;
     use reth_dns_discovery::tree::LinkEntry;
@@ -772,6 +779,17 @@ mod tests {
         let mainnet_dns: LinkEntry =
             Chain::mainnet().public_dns_network_protocol().unwrap().parse().unwrap();
         assert!(bootstrap_nodes.contains(&mainnet_dns));
+        assert_eq!(bootstrap_nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_network_dns_polygon_defaults() {
+        let config = builder().build_with_noop_provider(POLYGON.clone());
+
+        let dns = config.dns_discovery_config.unwrap();
+        let bootstrap_nodes = dns.bootstrap_dns_networks.unwrap();
+        let polygon_dns: LinkEntry = POLYGON_DNS_DISCOVERY.parse().unwrap();
+        assert!(bootstrap_nodes.contains(&polygon_dns));
         assert_eq!(bootstrap_nodes.len(), 1);
     }
 
